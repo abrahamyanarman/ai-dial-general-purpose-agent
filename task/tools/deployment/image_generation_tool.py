@@ -22,63 +22,28 @@ class ImageGenerationTool(DeploymentTool):
         #    'The image has been successfully generated according to request and shown to user!'
         #    Sometimes models are trying to add generated pictures as well to content (choice), with this instruction
         #    we are notifing LLLM that it was done (but anyway sometimes it will try to add file 😅)
-        message = await super()._execute(tool_call_params)
-        
-        if message.custom_content and message.custom_content.attachments:
-            for attachment in message.custom_content.attachments:
-                if attachment.type in ["image/png", "image/jpeg"]:
-                    tool_call_params.choice.append_content(f"\n\r![image]({attachment.url})\n\r")
-                    
-        if not message.content:
-            message.content = StrictStr('The image has been successfully generated according to request and shown to user!')
-            
-        return message
+        raise NotImplementedError()
 
     @property
     def deployment_name(self) -> str:
         # TODO: provide deployment name for model that you have added to DIAL Core config (dall-e-3)
-        return "dall-e-3"
+        raise NotImplementedError()
 
     @property
     def name(self) -> str:
         # TODO: provide self-descriptive name
-        return "image_generation"
+        raise NotImplementedError()
 
     @property
     def description(self) -> str:
         # TODO: provide tool description that will help LLM to understand when to use this tools and cover 'tricky'
         #  moments (not more 1024 chars)
-        return "Generates images from textual descriptions using DALL-E 3."
-
+        raise NotImplementedError()
     @property
     def parameters(self) -> dict[str, Any]:
         # TODO: provide tool parameters JSON Schema:
         #  - prompt is string, description: "Extensive description of the image that should be generated.", required
         #  - there are 3 optional parameters: https://platform.openai.com/docs/guides/image-generation?image-generation-model=dall-e-3#customize-image-output
         #  - Sample: https://learn.microsoft.com/en-us/azure/ai-foundry/openai/how-to/dall-e?tabs=dalle-3#call-the-image-generation-api
-        return {
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "Extensive description of the image that should be generated."
-                },
-                "quality": {
-                    "type": "string",
-                    "enum": ["standard", "hd"],
-                    "description": "The quality of the image that will be generated."
-                },
-                "size": {
-                    "type": "string",
-                    "enum": ["1024x1024", "1024x1792", "1792x1024"],
-                    "description": "The size of the generated images."
-                },
-                "style": {
-                    "type": "string",
-                    "enum": ["vivid", "natural"],
-                    "description": "The style of the generated images."
-                }
-            },
-            "required": ["prompt"]
-        }
+        raise NotImplementedError()
 
