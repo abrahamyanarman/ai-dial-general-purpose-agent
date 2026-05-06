@@ -1,6 +1,6 @@
 import json
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Optional
 
 from aidial_client import AsyncDial
 from aidial_sdk.chat_completion import Message, Role, CustomContent
@@ -24,22 +24,80 @@ class DeploymentTool(BaseTool, ABC):
     def tool_parameters(self) -> dict[str, Any]:
         return {}
 
+    @property
+    def system_prompt(self) -> Optional[str]:
+        return None
+
     async def _execute(self, tool_call_params: ToolCallParams) -> str | Message:
-        #TODO:
-        # 1. Load arguments with `json`
-        # 2. Get `prompt` from arguments (by default we provide `prompt` for each deployment tool, use this param name as standard)
-        # 3. Delete `prompt` from `arguments` (there can be provided additional parameters and `prompt` will be added
-        #    as user message content and other parameters as `custom_fields`)
-        # 4. Create AsyncDial client (api_version is 2025-01-01-preview)
-        # 5. Call chat completions with:
-        #   - messages (here will be just user message. Optionally, in this class you can add system prompt `property`
-        #     and if any deployment tool provides system prompt then we need to set it as first message (system prompt))
-        #   - stream it
-        #   - deployment_name
-        #   - extra_body with `custom_fields` https://dialx.ai/dial_api#operation/sendChatCompletionRequest (last request param in documentation)
-        #   - **self.tool_parameters (will load all tool parameters that were set up in deployment tools as params, like
-        #     `top_p`, `temperature`, etc...)
-        # 6. Collect content and it to stage, also, collect custom_content -> attachments and if they are present add
-        #    them to stage as attachment as well
-        # 7. Return Message with tool role, content, custom_content and tool_call_id
-        raise NotImplementedError()
+        arguments = json.loads(tool_call_params.tool_call.function.arguments)
+        prompt = arguments.get("prompt", "")
+        if "prompt" in arguments:
+            del arguments["prompt"]
+
+        stage = tool_call_params.stage
+
+        client = AsyncDial(
+            base_url=self.endpoint,
+            api_key=tool_call_params.api_key,
+            api_version="2025-01-01-preview",
+        )
+
+        messages: list[dict[str, Any]] = []
+        if self.system_prompt:
+            messages.append({"role": Role.SYSTEM.value, "content": self.system_prompt})
+        messages.append({"role": Role.USER.value, "content": prompt})
+
+        stage.append_content("## Request arguments: \n")
+        stage.append_content(f"```json\n\r{json.dumps({'prompt': prompt, **arguments}, indent=2)}\n\r```\n\r")
+        stage.append_content("## Response: \n")
+
+        create_kwargs: dict[str, Any] = {
+            "messages": messages,
+            "deployment_name": self.deployment_name,
+            "stream": True,
+            **self.tool_parameters,
+        }
+        if arguments:
+            create_kwargs["custom_fields"] = {"configuration": arguments}
+
+        chunks_stream = await client.chat.completions.create(**create_kwargs)
+
+        content = ""
+        attachments_collected = []
+        async for chunk in chunks_stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if not delta:
+                continue
+            if delta.content:
+                content += delta.content
+                stage.append_content(delta.content)
+            custom_content = getattr(delta, "custom_content", None)
+            if custom_content:
+                attachments = getattr(custom_content, "attachments", None) or []
+                for attachment in attachments:
+                    attachments_collected.append(attachment)
+                    try:
+                        stage.add_attachment(
+                            type=getattr(attachment, "type", None),
+                            title=getattr(attachment, "title", None),
+                            url=getattr(attachment, "url", None),
+                            data=getattr(attachment, "data", None),
+                            reference_url=getattr(attachment, "reference_url", None),
+                            reference_type=getattr(attachment, "reference_type", None),
+                        )
+                    except Exception as e:
+                        print(f"⚠️ Unable to add attachment to stage: {e}")
+
+        custom_content_obj = None
+        if attachments_collected:
+            custom_content_obj = CustomContent(attachments=attachments_collected)
+
+        return Message(
+            role=Role.TOOL,
+            content=StrictStr(content) if content else StrictStr(""),
+            custom_content=custom_content_obj,
+            tool_call_id=StrictStr(tool_call_params.tool_call.id),
+            name=StrictStr(tool_call_params.tool_call.function.name),
+        )
