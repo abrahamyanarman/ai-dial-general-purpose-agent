@@ -27,7 +27,11 @@ class GeneralPurposeAgent:
         #    on the tool call step
         # 3. Create dict with `state` name. Inside this dict we need to add `TOOL_CALL_HISTORY_KEY` with empty array.
         #    Here, in state, we will 'hide' tool call history. We need it since we need to preserve full conversation history.
-        raise NotImplementedError()
+        self._endpoint = endpoint
+        self._system_prompt = system_prompt
+        self._tools = tools
+        self._tools_dict = {tool.name: tool for tool in tools}
+        self._state = {TOOL_CALL_HISTORY_KEY: []}
 
     async def handle_request(self, deployment_name: str, choice: Choice, request: Request, response: Response) -> Message:
         #TODO:
@@ -57,9 +61,45 @@ class GeneralPurposeAgent:
         #                     then check if provided tool_call_delta contains `function`, if yes then you need to get from
         #                     `function` `arguments` (if not present set them as empty string to not attach haphazardly None)
         #                     as `argument_chunk` and add it to the extracted from map tool_call function arguments
+        client = AsyncDial(base_url=self._endpoint, api_key=request.api_key, api_version=request.api_version)
+        
+        tools_schemas = [tool.schema for tool in self._tools] or None
+        
+        chunks = await client.chat.completions.create(
+            messages=self._prepare_messages(request.messages),
+            tools=tools_schemas,
+            model=deployment_name,
+            stream=True
+        )
+
+        tool_call_index_map = {}
+        content = ""
+
+        async for chunk in chunks:
+            if chunk.choices:
+                delta = chunk.choices[0].delta
+                if delta:
+                    if delta.content:
+                        choice.append_content(delta.content)
+                        content += delta.content
+                    if delta.tool_calls:
+                        for tool_call_delta in delta.tool_calls:
+                            index = tool_call_delta.index
+                            if tool_call_delta.id:
+                                tool_call_index_map[index] = tool_call_delta
+                            else:
+                                existing_tool_call = tool_call_index_map[index]
+                                if tool_call_delta.function:
+                                    if existing_tool_call.function.arguments is None:
+                                        existing_tool_call.function.arguments = ""
+                                    existing_tool_call.function.arguments += tool_call_delta.function.arguments or ""
+
         # 5. Create `assistant_message`, with role, content and tool_calls. `tool_calls` should be a list with ToolCall
         #    objects generated from `tool_call_index_map` dict values. to create ToolCall use `validate` method (it
         #    will show you the notification that it is deprecated but we need to use it because DIAL SDK is built on top of pydentic.v1)
+        tool_calls = [ToolCall.validate(tc) for tc in tool_call_index_map.values()] or None
+        assistant_message = Message(role=Role.ASSISTANT, content=content, tool_calls=tool_calls)
+
         # 6. Now we at the point where we need to understand if its 'final result' from orchestration model or not:
         #    check if `assistant_message` contains `tool_calls`, if yes then we need:
         #       - create `tasks` list. Iterate through `tool_calls` and call `_process_tool_call` method (do not use
@@ -69,8 +109,22 @@ class GeneralPurposeAgent:
         #       - to the `state` to `TOOL_CALL_HISTORY_KEY` append `assistant_message` as dict and exclude none from this dict
         #       - extend the `state` `TOOL_CALL_HISTORY_KEY` with tool_messages that we executed above
         #       - finally make recursive call
+        if assistant_message.tool_calls:
+            conversation_id = request.headers.get("x-conversation-id")
+            tasks = [
+                self._process_tool_call(tc, choice, request.api_key, conversation_id)
+                for tc in assistant_message.tool_calls
+            ]
+            tool_messages = await asyncio.gather(*tasks)
+            
+            self._state[TOOL_CALL_HISTORY_KEY].append(assistant_message.dict(exclude_none=True))
+            self._state[TOOL_CALL_HISTORY_KEY].extend(tool_messages)
+            
+            return await self.handle_request(deployment_name, choice, request, response)
+
         # 7. We don't have any tool calls and reasy to finish user request. Set choice with `state` and return `assistant_message`
-        raise NotImplementedError()
+        choice.set_state(self._state)
+        return assistant_message
 
     def _prepare_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
         #TODO:
@@ -80,7 +134,13 @@ class GeneralPurposeAgent:
         #    easier to manipulate LLM, so, best practices are to hide system prompt)
         # 3. Print history: iterate through unpacked messages and print as json (json.dumps)
         # 4. Return unpacked messages
-        raise NotImplementedError()
+        unpacked_messages = unpack_messages(messages, self._state[TOOL_CALL_HISTORY_KEY])
+        unpacked_messages.insert(0, {"role": Role.SYSTEM, "content": self._system_prompt})
+        
+        for msg in unpacked_messages:
+            print(json.dumps(msg))
+            
+        return unpacked_messages
 
     async def _process_tool_call(self, tool_call: ToolCall, choice: Choice, api_key: str, conversation_id: str) -> dict[str, Any]:
         #TODO:
@@ -96,4 +156,25 @@ class GeneralPurposeAgent:
         # 5. Execute tool
         # 6. Close stage with StageProcessor
         # 7. Return tool message as dict and don't forget to exclude none
-        raise NotImplementedError()
+        tool_name = tool_call.function.name
+        stage = StageProcessor.open_stage(choice, tool_name)
+        tool = self._tools_dict[tool_name]
+        
+        if tool.show_in_stage:
+            stage.append_content("## Request arguments: \n")
+            arguments = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+            stage.append_content(f"```json\n\r{json.dumps(arguments, indent=2)}\n\r```\n\r")
+            stage.append_content("## Response: \n")
+            
+        tool_call_params = ToolCallParams(
+            tool_call=tool_call,
+            stage=stage,
+            choice=choice,
+            api_key=api_key,
+            conversation_id=conversation_id
+        )
+        
+        tool_message = await tool.execute(tool_call_params)
+        StageProcessor.close_stage_safely(stage)
+        
+        return tool_message.dict(exclude_none=True)

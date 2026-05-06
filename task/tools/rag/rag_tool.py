@@ -15,6 +15,9 @@ from task.utils.dial_file_conent_extractor import DialFileContentExtractor
 
 # TODO: provide system prompt for Generation step
 _SYSTEM_PROMPT = """
+You are a helpful assistant that answers questions based on the provided document context.
+If the context doesn't contain the answer, say that you don't know based on the provided document.
+Always cite the source if possible.
 """
 
 
@@ -39,30 +42,52 @@ class RagTool(BaseTool):
         #   - chunk_overlap=50
         #   - length_function=len
         #   - separators=["\n\n", "\n", ". ", " ", ""]
-        raise NotImplementedError()
+        self._endpoint = endpoint
+        self._deployment_name = deployment_name
+        self._document_cache = document_cache
+        self._model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+        self._text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50,
+            length_function=len,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
 
     @property
     def show_in_stage(self) -> bool:
         # TODO: set as False since we will have custom variant of representation in Stage
-        raise NotImplementedError()
+        return False
 
     @property
     def name(self) -> str:
         # TODO: provide self-descriptive name
-        raise NotImplementedError()
+        return "rag_search"
 
     @property
     def description(self) -> str:
         # TODO: provide tool description that will help LLM to understand when to use this tools and cover 'tricky'
         #  moments (not more 1024 chars)
-        raise NotImplementedError()
+        return "Performs semantic search on large documents to find relevant information. Use this for PDF, TXT, CSV, or HTML files when you need to find specific answers in a large amount of text."
 
     @property
     def parameters(self) -> dict[str, Any]:
         # TODO: provide tool parameters JSON Schema:
         #  - request is string, description: "The search query or question to search for in the document", required
         #  - file_url is string, required
-        raise NotImplementedError()
+        return {
+            "type": "object",
+            "properties": {
+                "request": {
+                    "type": "string",
+                    "description": "The search query or question to search for in the document"
+                },
+                "file_url": {
+                    "type": "string",
+                    "description": "The URL of the file to search in"
+                }
+            },
+            "required": ["request", "file_url"]
+        }
 
 
     async def _execute(self, tool_call_params: ToolCallParams) -> str | Message:
@@ -98,8 +123,63 @@ class RagTool(BaseTool):
         #   - stream response to stage (user in real time will be able to see what the LLM responding while Generation step)
         #   - collect all content (we need to return it as tool execution result)
         # 19. return collected content
-        raise NotImplementedError()
+        arguments = json.loads(tool_call_params.tool_call.function.arguments)
+        request = arguments.get("request")
+        file_url = arguments.get("file_url")
+        
+        stage = tool_call_params.stage
+        stage.append_content("## Request arguments: \n")
+        stage.append_content(f"**Request**: {request}\n\r")
+        stage.append_content(f"**File URL**: {file_url}\n\r")
+        
+        cache_document_key = f"{tool_call_params.conversation_id}_{file_url}"
+        cached_data = self._document_cache.get(cache_document_key)
+        
+        if cached_data:
+            index, chunks = cached_data
+        else:
+            extractor = DialFileContentExtractor(self._endpoint, tool_call_params.api_key)
+            text_content = extractor.extract_text(file_url)
+            if not text_content:
+                stage.append_content("Error: File content not found.\n\r")
+                return "Error: File content not found."
+            
+            chunks = self._text_splitter.split_text(text_content)
+            embeddings = self._model.encode(chunks)
+            index = faiss.IndexFlatL2(384)
+            index.add(np.array(embeddings).astype('float32'))
+            self._document_cache.set(cache_document_key, index, chunks)
+            
+        query_embedding = self._model.encode([request]).astype('float32')
+        distances, indices = index.search(query_embedding, k=3)
+        
+        retrieved_chunks = [chunks[idx] for idx in indices[0] if idx != -1]
+        augmented_prompt = self.__augmentation(request, retrieved_chunks)
+        
+        stage.append_content("## RAG Request: \n")
+        stage.append_content(f"```text\n\r{augmented_prompt}\n\r```\n\r")
+        stage.append_content("## Response: \n")
+        
+        client = AsyncDial(base_url=self._endpoint, api_key=tool_call_params.api_key, api_version='2025-01-01-preview')
+        chunks_stream = await client.chat.completions.create(
+            messages=[
+                {"role": Role.SYSTEM.value, "content": _SYSTEM_PROMPT},
+                {"role": Role.USER.value, "content": augmented_prompt}
+            ],
+            model=self._deployment_name,
+            stream=True
+        )
+        
+        collected_content = ""
+        async for chunk in chunks_stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                content_chunk = chunk.choices[0].delta.content
+                stage.append_content(content_chunk)
+                collected_content += content_chunk
+                
+        return collected_content
 
     def __augmentation(self, request: str, chunks: list[str]) -> str:
         #TODO: make prompt augmentation
-        raise NotImplementedError()
+        context = "\n---\n".join(chunks)
+        return f"Context information is below.\n---------------------\n{context}\n---------------------\nGiven the context information and not prior knowledge, answer the query.\nQuery: {request}\nAnswer: "

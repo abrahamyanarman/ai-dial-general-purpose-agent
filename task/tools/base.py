@@ -23,7 +23,22 @@ class BaseTool(ABC):
         #         assign result to created message in 1st step, otherwise set Message `content` as StrictStr(result)
         #       - In `except` block intercept Exception and add it properly to Message `content`
         # 3. Return created message
-        raise NotImplementedError()
+        message = Message(
+            role=Role.TOOL,
+            name=StrictStr(tool_call_params.tool_call.function.name),
+            tool_call_id=StrictStr(tool_call_params.tool_call.id)
+        )
+        
+        try:
+            result = await self._execute(tool_call_params)
+            if isinstance(result, Message):
+                message = result
+            else:
+                message.content = StrictStr(result)
+        except Exception as e:
+            message.content = StrictStr(f"Error during tool execution: {str(e)}")
+            
+        return message
 
     @abstractmethod
     async def _execute(self, tool_call_params: ToolCallParams) -> str | Message:
@@ -54,7 +69,6 @@ class BaseTool(ABC):
         #TODO:
         # see https://dialx.ai/dial_api#operation/sendChatCompletionRequest -> `tools`
         # or https://platform.openai.com/docs/guides/function-calling#defining-functions
-        raise NotImplementedError()
         return ToolParam(
             type="function",
             function=FunctionParam(
